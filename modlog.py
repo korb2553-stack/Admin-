@@ -62,9 +62,6 @@ class ActionModal(discord.ui.Modal):
         self.v = v
         self.uid = discord.ui.TextInput(label="User ID ผู้ถูกดำเนินการ", min_length=15, max_length=22)
         self.add_item(self.uid)
-        self.reason = discord.ui.TextInput(
-            label="สาเหตุ", style=discord.TextStyle.paragraph, max_length=500, required=v.kind != "summon")
-        self.add_item(self.reason)
         self.rule = self.extra = None
         if v.kind in ("warn", "punish"):
             self.rule = discord.ui.TextInput(label="ผิดกฎข้อที่ (ไม่บังคับ)", required=False, max_length=100)
@@ -94,7 +91,7 @@ class ActionModal(discord.ui.Modal):
         note = self.note.value.strip()
         if not note:
             return await i.response.send_message("ต้องระบุหมายเหตุ", ephemeral=True)
-        reason = self.reason.value or ""
+        reason = ""
         rule = self.rule.value if self.rule else ""
         uid = int(raw)
         if self.v.kind == "ban":
@@ -478,7 +475,7 @@ class ModLog(commands.Cog):
         e.add_field(name="📋 แอดมินผู้ขอ (Requester)" if kind == "ban" else "👮 ผู้ดำเนินการ (Executor)",
                     value=i.user.mention, inline=False)
 
-        # 1) DM
+        # 1) DM หาสมาชิกทุกเมนู (ตักเตือน / หมายเรียก / ลงโทษ+ใบ / แบน) ก่อนดำเนินการ
         try:
             await target.send(embed=e)
             dm = "✅ ส่งถึงสมาชิกสำเร็จ"
@@ -509,14 +506,14 @@ class ModLog(commands.Cog):
                     await rec.send(content=target.mention, embed=e)
                     notes.append(f"บันทึกประวัติที่ {rec.mention} แล้ว")
             if kind == "punish":
-                await member.timeout(timedelta(hours=min(extra, 672)), reason=f"ลงโทษโดย {i.user}: {reason}")
+                await member.timeout(timedelta(hours=min(extra, 672)), reason=f"ลงโทษโดย {i.user}: {note}")
                 notes.append(f"Timeout {min(extra, 672):g} ชั่วโมงแล้ว")
             if kind == "summon":
                 self.data["summons"].append({"guild": guild.id, "user": member.id, "voice": v.voice_id,
                                              "channel": channel.id, "deadline": deadline})
                 notes.append("ตั้งเวลาเช็กการเข้าพบแล้ว")
             if kind == "ban":
-                await guild.ban(target, reason=f"แบนถาวรโดย {i.user}: {reason}", delete_message_seconds=0)
+                await guild.ban(target, reason=f"แบนถาวรโดย {i.user}: {note}", delete_message_seconds=0)
                 notes.append("แบนแล้ว")
             save(self.data)
         except (discord.Forbidden, AttributeError):

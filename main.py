@@ -10,14 +10,19 @@ if not TOKEN and os.path.exists("token.txt"):
     with open("token.txt", encoding="utf-8") as f:
         TOKEN = f.read().strip()
 
+intents = discord.Intents.default()
+intents.members = True          # ต้องเปิด Server Members Intent ใน Developer Portal
+intents.message_content = True  # ต้องเปิด Message Content Intent ใน Developer Portal
+
 
 class AdminBot(commands.Bot):
     async def setup_hook(self):
         await self.load_extension("modlog")
+        await self.load_extension("protect")
         await self.tree.sync()
 
 
-bot = AdminBot(command_prefix="!", intents=discord.Intents.default())
+bot = AdminBot(command_prefix="!", intents=intents)
 
 
 @bot.event
