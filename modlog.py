@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -7,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 DATA_FILE = "modlog_data.json"
-DEFAULT = {"admin_roles": [], "cards": {}, "summons": [], "noshow_hours": 1, "record_channel": None, "channels": {},
+DEFAULT = {"admin_roles": [], "cards": {}, "summons": [], "noshow_hours": 1, "record_channel": None, "channels": {}, "noshow": {}, "panel": {},
            "status": {"name": "ดูแลเซิร์ฟเวอร์", "url": "https://www.twitch.tv/discord"}}
 # cards   = {"ใบเหลือง": {"role_id": 123}}   ใบติดตัวถาวร ไม่มีหมดเวลา
 # summons = [{"guild":1,"user":2,"voice":3,"channel":4,"deadline":ts}] หมายเรียกที่รอเช็กเวลา
@@ -23,6 +25,9 @@ CHANNEL_SPEC = [
 ]
 # เมนูไหน ให้ส่งห้องไหนเป็นค่าเริ่มต้น (แอดมินยังเปลี่ยนห้องได้ตอนใช้)
 DEFAULT_ROUTE = {"warn": "warn", "summon": "summon", "punish": "record", "ban": "trash"}
+# ห้อง log ของระบบป้องกันดิส (แยกหมวดจากระบบตักเตือน)
+PROTECT_CATEGORY_NAME = "🛡️ - Protect Log ⋆ 🛡️"
+PROTECT_CHANNEL_NAME = "│・🛡️⁺｡ล็อกป้องกันดิส"
 
 EMBED_HEAD = {
     "warn": ("⚠️ บันทึกการตักเตือนสมาชิก (Official Warning Log)", 0xE67E22, "ระบบบันทึกการตักเตือน"),
@@ -167,6 +172,47 @@ class FlowView(discord.ui.View):
         await i.response.send_modal(ActionModal(self))
 
 
+# ───────────────────────── ปลดหมายเรียก ─────────────────────────
+class ReleaseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"modlog:release:(?P<uid>\d+)"):
+    """ปุ่มใต้ข้อความหมายเรียก (ใช้ได้ต่อหลังบอทรีสตาร์ต)"""
+
+    def __init__(self, uid: int):
+        super().__init__(discord.ui.Button(label="ปลดหมายเรียก", emoji="🔓", style=discord.ButtonStyle.success,
+                                           custom_id=f"modlog:release:{uid}"))
+        self.uid = uid
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["uid"]))
+
+    async def interaction_check(self, i: discord.Interaction):
+        cog = i.client.get_cog("ModLog")
+        ok = cog is not None and (cog.is_admin(i.user) or await i.client.is_owner(i.user))
+        if not ok:
+            await i.response.send_message("เฉพาะแอดมินเท่านั้น", ephemeral=True)
+        return ok
+
+    async def callback(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        text = await i.client.get_cog("ModLog").release(i.guild, self.uid, i.user, message=i.message)
+        await i.followup.send(text, ephemeral=True)
+
+
+class ReleaseModal(discord.ui.Modal, title="ปลดหมายเรียก"):
+    uid = discord.ui.TextInput(label="User ID ผู้ถูกหมายเรียก", min_length=15, max_length=22)
+
+    def __init__(self, cog):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, i: discord.Interaction):
+        raw = self.uid.value.strip()
+        if not raw.isdigit():
+            return await i.response.send_message("User ID ต้องเป็นตัวเลขเท่านั้น", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        await i.followup.send(await self.cog.release(i.guild, int(raw), i.user), ephemeral=True)
+
+
 # ───────────────────────── เมนูหลักที่ส่งค้างไว้ในแชท ─────────────────────────
 class PanelView(discord.ui.View):
     def __init__(self, cog):
@@ -194,6 +240,12 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="แบนถาวร", emoji="🔨", style=discord.ButtonStyle.danger, custom_id="modlog:ban")
     async def b_ban(self, i, b):
         await self._open(i, "ban")
+
+    @discord.ui.button(label="ปลดหมายเรียก", emoji="🔓", style=discord.ButtonStyle.success, custom_id="modlog:release_panel")
+    async def b_release(self, i, b):
+        if not (self.cog.is_admin(i.user) or await self.cog.bot.is_owner(i.user)):
+            return await i.response.send_message("เฉพาะแอดมินเท่านั้น", ephemeral=True)
+        await i.response.send_modal(ReleaseModal(self.cog))
 
 
 # ───────────────────────── เมนูตั้งค่า (เจ้าของเท่านั้น) ─────────────────────────
@@ -291,6 +343,34 @@ class SetupView(discord.ui.View):
         await i.response.edit_message(embed=self.cog.config_embed(), view=self)
 
 
+# ───────────────────────── แจ้ง error ให้เห็นทันที (แทนข้อความ "ไม่ตอบสนอง") ─────────────────────────
+async def report_error(i: discord.Interaction, error: Exception):
+    traceback.print_exception(type(error), error, error.__traceback__)   # ไปโผล่ใน Console ของโฮสต์
+    msg = f"⚠️ เกิดข้อผิดพลาด: `{type(error).__name__}: {str(error)[:300]}`"
+    try:
+        if i.response.is_done():
+            await i.followup.send(msg, ephemeral=True)
+        else:
+            await i.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+async def _view_error(self, i: discord.Interaction, error: Exception, item=None):
+    await report_error(i, error)
+
+
+async def _modal_error(self, i: discord.Interaction, error: Exception):
+    await report_error(i, error)
+
+
+for _c in (PanelView, FlowView, ConfirmBan, SetupView):
+    _c.on_error = _view_error
+for _c in (ActionModal, ReleaseModal, CardModal, DelCardModal, NoShowModal):
+    _c.on_error = _modal_error
+ReleaseButton.on_error = _modal_error
+
+
 # ───────────────────────── Cog หลัก ─────────────────────────
 class ModLog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -299,6 +379,7 @@ class ModLog(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(PanelView(self))   # ให้ปุ่มในแชทใช้ได้ต่อหลังบอทรีสตาร์ต
+        self.bot.add_dynamic_items(ReleaseButton)
         self.loop.start()
 
     def cog_unload(self):
@@ -342,19 +423,67 @@ class ModLog(commands.Cog):
         await self.apply_status()
         await i.response.send_message("เปลี่ยนสถานะสตรีมมิ่งแล้ว", ephemeral=True)
 
-    @app_commands.command(name="postpanel", description="ส่งเมนูค้างไว้ในแชทนี้ (เจ้าของบอทเท่านั้น)")
+    @app_commands.command(name="postpanel", description="ส่งเมนูค้างไว้ในแชท แนบรูปได้ (เจ้าของบอทเท่านั้น)")
+    @app_commands.describe(channel="ห้องที่จะส่ง (ไม่ใส่ = ห้องนี้)", image="รูปใหญ่บนเมนู",
+                           thumbnail="รูปเล็กมุมขวาบนของเมนู", title="หัวข้อเมนู",
+                           description="ข้อความในเมนู (พิมพ์ \\n เพื่อขึ้นบรรทัดใหม่)",
+                           clear="ล้างรูป/ข้อความที่เคยตั้งไว้ กลับเป็นค่าเริ่มต้น")
     @app_commands.guild_only()
-    async def postpanel(self, i: discord.Interaction, channel: discord.TextChannel = None):
+    async def postpanel(self, i: discord.Interaction, channel: discord.TextChannel = None,
+                        image: discord.Attachment = None, thumbnail: discord.Attachment = None,
+                        title: str = None, description: str = None, clear: bool = False):
         if not await self.bot.is_owner(i.user):
             return await i.response.send_message("เฉพาะเจ้าของเท่านั้น", ephemeral=True)
+        await i.response.defer(ephemeral=True)
         ch = channel or i.channel
+        pn = self.data["panel"]
+        if clear:
+            for k in ("title", "description", "image", "thumb"):
+                pn.pop(k, None)
+
+        os.makedirs("panel_assets", exist_ok=True)
+        for key, att in (("image", image), ("thumb", thumbnail)):
+            if att is None:
+                continue
+            if not (att.content_type or "").startswith("image/"):
+                return await i.followup.send("ไฟล์ที่แนบต้องเป็นรูปภาพ", ephemeral=True)
+            if att.size > 8 * 1024 * 1024:
+                return await i.followup.send("รูปใหญ่เกิน 8MB", ephemeral=True)
+            ext = os.path.splitext(att.filename)[1].lower() or ".png"
+            path = os.path.join("panel_assets", f"{key}{ext}")
+            with open(path, "wb") as f:
+                f.write(await att.read())
+            pn[key] = path
+        if title:
+            pn["title"] = title[:256]
+        if description:
+            pn["description"] = description.replace("\\n", "\n")[:2000]
+
         e = discord.Embed(
-            title="🚨 ระบบจัดการผู้ใช้ (เฉพาะแอดมิน)",
-            description="กดปุ่มด้านล่างเพื่อเลือกดำเนินการ\n"
-                        "⚠️ ตักเตือน • 📞 หมายเรียก • 🟡 ลงโทษ • 🔨 แบนถาวร",
+            title=pn.get("title") or "🚨 ระบบจัดการผู้ใช้ (เฉพาะแอดมิน)",
+            description=pn.get("description") or "กดปุ่มด้านล่างเพื่อเลือกดำเนินการ\n"
+                        "⚠️ ตักเตือน • 📞 หมายเรียก • 🟡 ลงโทษ • 🔨 แบนถาวร • 🔓 ปลดหมายเรียก",
             color=0x5865F2)
-        await ch.send(embed=e, view=PanelView(self))
-        await i.response.send_message(f"ส่งเมนูไปที่ {ch.mention} แล้ว", ephemeral=True)
+        files = []
+        for key, setter in (("image", e.set_image), ("thumb", e.set_thumbnail)):
+            path = pn.get(key)
+            if path and os.path.exists(path):
+                fn = os.path.basename(path)
+                files.append(discord.File(path, filename=fn))
+                setter(url=f"attachment://{fn}")
+
+        old = pn.get("msg")
+        sent = await ch.send(embed=e, files=files, view=PanelView(self))
+        if old:                                  # ลบเมนูเก่า เหลืออันเดียว
+            try:
+                oc = i.guild.get_channel(old[0])
+                if oc:
+                    await (await oc.fetch_message(old[1])).delete()
+            except discord.HTTPException:
+                pass
+        pn["msg"] = [ch.id, sent.id]
+        save(self.data)
+        await i.followup.send(f"ส่งเมนูไปที่ {ch.mention} แล้ว", ephemeral=True)
 
     @app_commands.command(name="setup", description="ตั้งค่ายศและใบ (เจ้าของบอทเท่านั้น)")
     @app_commands.guild_only()
@@ -401,15 +530,104 @@ class ModLog(commands.Cog):
                     await ch.edit(category=cat, overwrites=ow)
                     lines.append(f"มีอยู่แล้ว {ch.mention} (อัปเดตสิทธิ์)")
                 ids[key] = ch.id
+
+            # หมวดแยกสำหรับ log ระบบป้องกันดิส (ไม่ปนกับระบบตักเตือน)
+            pcat = guild.get_channel(self.data["channels"].get("protect_category", 0))
+            if pcat is None:
+                pcat = await guild.create_category(PROTECT_CATEGORY_NAME, overwrites=ow, reason=f"สร้างโดย {i.user}")
+            else:
+                await pcat.edit(overwrites=ow)
+            ids["protect_category"] = pcat.id
+            pch = guild.get_channel(self.data["channels"].get("protect_log", 0))
+            if pch is None:
+                pch = await guild.create_text_channel(PROTECT_CHANNEL_NAME, category=pcat, overwrites=ow,
+                                                      reason=f"สร้างโดย {i.user}")
+                plines = [f"สร้าง {pch.mention}"]
+            else:
+                await pch.edit(category=pcat, overwrites=ow)
+                plines = [f"มีอยู่แล้ว {pch.mention} (อัปเดตสิทธิ์)"]
+            ids["protect_log"] = pch.id
         except discord.Forbidden:
             return await i.followup.send("บอทไม่มีสิทธิ์ Manage Channels / Manage Roles", ephemeral=True)
         self.data["channels"] = ids
         self.data["record_channel"] = ids["record"]
         save(self.data)
+        pc = self.bot.get_cog("Protect")          # ผูกเป็นห้อง log ของระบบป้องกันให้อัตโนมัติ
+        if pc is not None:
+            try:
+                pc.cfg["log_channel"] = ids["protect_log"]
+                sys.modules[type(pc).__module__].save(pc.cfg)
+                plines.append("ตั้งเป็นห้อง log ของระบบป้องกันให้แล้ว")
+            except Exception:
+                plines.append("⚠️ ตั้งเป็นห้อง log ป้องกันให้เองไม่สำเร็จ ให้ตั้งที่ /protect")
+        else:
+            plines.append("ตั้งห้องนี้เป็นห้อง log ที่ /protect")
         msg = f"หมวดหมู่ **{cat.name}**\n" + "\n".join(lines)
+        msg += f"\n\nหมวดหมู่ **{pcat.name}** (แยกจากระบบตักเตือน)\n" + "\n".join(plines)
         if missing:
             msg += "\n\n⚠️ ยังไม่ได้ตั้งยศแอดมินใน /setup ตอนนี้เห็นแค่บอทกับแอดมินเซิร์ฟเวอร์ ตั้งยศแล้วรันคำสั่งนี้ซ้ำเพื่ออัปเดตสิทธิ์"
         await i.followup.send(msg, ephemeral=True)
+
+    async def release(self, guild, uid, by, message=None):
+        """ปลดหมายเรียก: ยกเลิกการนับเวลา + ปลด Timeout ที่มาจากการไม่มาตามนัด + อัปเดตข้อความ"""
+        d = self.data
+        pend = [x for x in d["summons"] if x["guild"] == guild.id and x["user"] == uid]
+        d["summons"] = [x for x in d["summons"] if not (x["guild"] == guild.id and x["user"] == uid)]
+        until = d["noshow"].pop(f"{guild.id}:{uid}", None)
+        try:
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+        except discord.HTTPException:
+            member = None
+        lifted = False
+        if until and until > ts(now()) and member:
+            try:
+                await member.timeout(None, reason=f"ปลดหมายเรียกโดย {by}")
+                lifted = True
+            except discord.HTTPException:
+                pass
+        save(d)
+
+        if not pend and not until and message is None:
+            return "ไม่พบหมายเรียกที่ค้างอยู่ของคนนี้ (อาจปลดไปแล้วหรือหมดเวลา)"
+
+        msg = message
+        if msg is None and pend and pend[0].get("msg"):
+            ch = guild.get_channel(pend[0]["channel"])
+            if ch:
+                try:
+                    msg = await ch.fetch_message(pend[0]["msg"])
+                except discord.HTTPException:
+                    msg = None
+        stamp = ts(now())
+        if msg is not None and msg.embeds:
+            e = msg.embeds[0]
+            e.title = "🔓 ปลดหมายเรียกแล้ว (Summon Released)"
+            e.color = 0x2ECC71
+            e.add_field(name="🔓 ปลดโดย", value=f"{by.mention} <t:{stamp}:R>", inline=False)
+            try:
+                await msg.edit(embed=e, view=None)
+            except discord.HTTPException:
+                pass
+        else:
+            ch = guild.get_channel(d["channels"].get("summon", 0))
+            if ch:
+                try:
+                    await ch.send(embed=discord.Embed(
+                        title="🔓 ปลดหมายเรียกแล้ว (Summon Released)", color=0x2ECC71,
+                        description=f"<@{uid}> ถูกปลดหมายเรียกโดย {by.mention}"))
+                except discord.HTTPException:
+                    pass
+        if member:
+            try:
+                await member.send(embed=discord.Embed(
+                    title="🔓 หมายเรียกของคุณถูกปลดแล้ว", color=0x2ECC71,
+                    description=f"ปลดโดย {by.display_name}\nไม่ต้องเข้าห้องติดต่อประสานงานแล้ว"))
+            except discord.HTTPException:
+                pass
+        out = "ปลดหมายเรียกแล้ว"
+        if lifted:
+            out += " และปลด Timeout จากการไม่มาตามนัดให้แล้ว"
+        return out
 
     async def run(self, i: discord.Interaction, v: FlowView, uid, reason, rule, extra, note):
         await i.response.defer(ephemeral=True)
@@ -488,7 +706,12 @@ class ModLog(commands.Cog):
         e.set_footer(text=footer)
 
         # 2) ส่งไปห้องที่ระบุ
-        await channel.send(content=target.mention, embed=e)
+        if kind == "summon":
+            rv = discord.ui.View(timeout=None)
+            rv.add_item(ReleaseButton(target.id))
+            sent = await channel.send(content=target.mention, embed=e, view=rv)
+        else:
+            sent = await channel.send(content=target.mention, embed=e)
 
         # 3) ส่งห้องเสร็จแล้ว ค่อยดำเนินการจริง (ใส่ใบ / timeout / แบน)
         notes = [f"ส่งไปที่ {channel.mention} แล้ว"]
@@ -510,7 +733,7 @@ class ModLog(commands.Cog):
                 notes.append(f"Timeout {min(extra, 672):g} ชั่วโมงแล้ว")
             if kind == "summon":
                 self.data["summons"].append({"guild": guild.id, "user": member.id, "voice": v.voice_id,
-                                             "channel": channel.id, "deadline": deadline})
+                                             "channel": channel.id, "deadline": deadline, "msg": sent.id})
                 notes.append("ตั้งเวลาเช็กการเข้าพบแล้ว")
             if kind == "ban":
                 await guild.ban(target, reason=f"แบนถาวรโดย {i.user}: {note}", delete_message_seconds=0)
@@ -541,6 +764,7 @@ class ModLog(commands.Cog):
             try:
                 m = await g.fetch_member(s["user"])
                 await m.timeout(timedelta(hours=self.data["noshow_hours"]), reason="ไม่มาตามหมายเรียก")
+                self.data["noshow"][f"{g.id}:{s['user']}"] = t + int(self.data["noshow_hours"] * 3600)
                 ch = g.get_channel(s["channel"])
                 if ch:
                     await ch.send(f"⏰ <@{s['user']}> ไม่มาตามหมายเรียก ถูก Timeout {self.data['noshow_hours']:g} ชั่วโมงแล้ว")
