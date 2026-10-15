@@ -1,4 +1,5 @@
 import os
+import time
 import traceback
 
 import discord
@@ -51,13 +52,24 @@ class AdminBot(commands.Bot):
         await self.load_extension("protect")
         await self.tree.sync()
 
-
-bot = AdminBot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
+    async def on_ready(self):
+        print(f"Logged in as {self.user}")
 
 
-bot.run(TOKEN)
+def make_bot():
+    return AdminBot(command_prefix="!", intents=intents)
+
+
+# ถ้า Discord/Cloudflare บล็อก IP ของโฮสต์ (429) บอทจะรอแล้วลองใหม่เอง
+# ไม่ล่ม และไม่ยิงล็อกอินรัว ๆ (การยิงถี่ ๆ ทำให้โดนบล็อกนานขึ้น)
+delay = 900  # 15 นาที
+while True:
+    try:
+        make_bot().run(TOKEN)
+        break
+    except discord.HTTPException as e:
+        if e.status != 429:
+            raise
+        print(f"⚠️ ล็อกอินไม่ได้ (429 โดนบล็อกชั่วคราว) รอ {delay // 60} นาทีแล้วลองใหม่ ไม่ต้องกด Start ซ้ำ")
+        time.sleep(delay)
+        delay = min(delay * 2, 3600)
