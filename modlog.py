@@ -385,8 +385,19 @@ class ModLog(commands.Cog):
     def cog_unload(self):
         self.loop.cancel()
 
+    def wl(self):
+        """ไวท์ลิสต์จากระบบป้องกัน (/protect) → ถือเป็นแอดมินของระบบนี้ด้วย"""
+        pc = self.bot.get_cog("Protect")
+        if pc is None:
+            return [], []
+        return pc.cfg.get("whitelist_roles", []), pc.cfg.get("whitelist_users", [])
+
     def is_admin(self, member):
-        return any(r.id in self.data["admin_roles"] for r in getattr(member, "roles", []))
+        roles = getattr(member, "roles", [])
+        if any(r.id in self.data["admin_roles"] for r in roles):
+            return True
+        wl_roles, wl_users = self.wl()
+        return member.id in wl_users or any(r.id in wl_roles for r in roles)
 
     def config_embed(self):
         roles = "\n".join(f"<@&{r}>" for r in self.data["admin_roles"]) or "ยังไม่มี"
@@ -394,6 +405,9 @@ class ModLog(commands.Cog):
                           for n, c in self.data["cards"].items()) or "ยังไม่มี"
         e = discord.Embed(title="⚙️ ตั้งค่าระบบ", color=0x5865F2)
         e.add_field(name="ยศที่ใช้คำสั่งได้", value=roles[:1000], inline=False)
+        wl_roles, wl_users = self.wl()
+        wl_txt = "\n".join([f"<@&{r}>" for r in wl_roles] + [f"<@{u}>" for u in wl_users]) or "ไม่มี"
+        e.add_field(name="ใช้ได้ด้วย (ไวท์ลิสต์จาก /protect)", value=wl_txt[:1000], inline=False)
         e.add_field(name="รายการใบ", value=cards[:1000], inline=False)
         e.add_field(name="โทษกรณีไม่มาตามนัด", value=f"Timeout {self.data['noshow_hours']} ชม.", inline=False)
         rc = self.data["record_channel"]
@@ -505,7 +519,7 @@ class ModLog(commands.Cog):
                                                   embed_links=True, read_message_history=True),
         }
         missing = True
-        for rid in self.data["admin_roles"]:
+        for rid in set(self.data["admin_roles"]) | set(self.wl()[0]):
             r = guild.get_role(rid)
             if r:
                 missing = False
